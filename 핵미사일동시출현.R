@@ -1,0 +1,178 @@
+# 패키지
+library(tm)
+library(tidyverse)
+library(topicmodels)
+library(stm)
+library(tidytext)
+library(reshape2)
+library(igraph)
+library(ggraph)
+library(pdftools)
+library(stringr)
+library(SnowballC)
+library(quanteda)
+library(widyr)
+library(tidygraph)
+
+# 경로(folder_path)
+folder_path <- "C:/Users/dlsdn/Desktop/논문작성2/인권문서모음_핵미사일"
+
+# PDF파일목록(pdf_files)
+pdf_files <- list.files(folder_path, pattern = "\\.pdf$", full.names = TRUE)
+
+# PDF에서 TEXT 추출(이름지정:all_text)
+all_text <- list()
+
+##### Custom stemming list #####
+stem_rules <- list(
+  "leader" = "kim",
+  "leadership" = "kim",
+  "supreme" = "kim"
+)
+
+# 어간추출함수정의(ChatGPT활용)
+custom_stem <- function(word) {
+  if (word %in% names(stem_rules)) {
+    return(stem_rules[[word]])
+  } else {
+    return(word)
+  }
+}
+
+# 어간추출적용함수정의(ChatGPT활용)
+apply_custom_stemming <- function(text) {
+  words <- unlist(strsplit(text, "\\s+"))
+  stemmed_words <- sapply(words, custom_stem)
+  return(paste(stemmed_words, collapse = " "))
+}
+
+# PDF 파일에서 TEXT 추출 및 어간 추출 적용
+for (pdf_file in pdf_files) {
+  cat(sprintf("Extracting text from file: %s\n", pdf_file))
+  
+  # 텍스트 추출
+  text <- pdftools::pdf_text(pdf_file)
+  
+  # 소문자 변환
+  text <- tolower(text)
+  
+  # 어간 추출 적용
+  text <- apply_custom_stemming(text)
+  
+  # 전처리 수행 (마침표, 쉼표 제외)
+  text <- gsub("[^a-zA-Z\\s\\.,]", " ", text)  # 특수문자 제거 (마침표와 쉼표 제외)
+  text <- gsub("\\b\\d+\\b", " ", text)     # 숫자 제거
+  text <- removeWords(text, stopwords("en"))  # 불용어 제거
+  text <- gsub("\\bdisabilities\\b", "disabl", text) #disabilities -> disabl
+  
+  # 특정 단어 제거 (24 07 13 update)
+  remove_words <- c("human", "rights", "special", "rapporteur", "international", 
+                    "situation", "un", "united", "nations", "dprk", "democratic", 
+                    "people", "s", "republic", "korea", "korean", "also", "commission",
+                    "country", "council", "north", "ohchr", "hrc", "will", "report", 
+                    "para", "state", "statement", "states", "resolution", "commissioner", 
+                    "committee","session", "mr")
+  text <- removeWords(text, remove_words)
+  
+  # 월 제거
+  months <- c("january", "february", "march", "april", "may", "june", 
+              "july", "august", "september", "october", "november", "december")
+  text <- removeWords(text, months)
+  
+  # 소문자로 변환된 텍스트를 문장 단위로 분리
+  sentences <- strsplit(text, "[.,]")[[1]]
+  
+  # 각 문장을 단어로 분리하여 단어의 개수를 세기
+  word_counts <- sapply(sentences, function(sentence) length(strsplit(sentence, "\\s+")[[1]]))
+  
+  # 단어의 개수가 5개 이상인 문장만 선택 (적용안하면 Mr. Ms. 이런것도 문장 인식해버림)
+  selected_sentences <- sentences[word_counts >= 5]
+  
+  # 선택된 문장을 리스트에 추가
+  all_text <- c(all_text, selected_sentences)  
+}
+
+###########################전 처 리############################
+
+# 정제된 텍스트를 data_frame(tibble)로 변환
+text_df <- tibble(text = unlist(all_text))
+
+text_df <- text_df %>% rownames_to_column(var = "rowid")
+
+# 단어 간의 동시 출현 빈도 계산
+pairwise_counts <- text_df %>%
+  unnest_tokens(word, text) %>%
+  pairwise_count(item = word, feature = rowid, sort = TRUE)
+
+pairwise_counts <- pairwise_counts %>%
+  mutate(item1 = pmin(item1, item2),
+         item2 = pmax(item1, item2)) %>%
+  distinct(item1, item2, .keep_all = TRUE)
+
+# 쌍의 순서를 바꾸어 중복을 제거하고 item1과 item2가 동일한 경우 제외
+pairwise_counts <- pairwise_counts %>%
+  mutate(pair = paste(pmin(item1, item2), pmax(item1, item2), sep = " ")) %>%
+  distinct(pair, .keep_all = TRUE) %>%
+  filter(item1 != item2)  # item1과 item2가 동일한 경우 제외
+
+# 결과 출력
+print(pairwise_counts)
+
+# 그래프로
+graph_pair <- pairwise_counts %>%
+  filter(n >= 125) %>% 
+  as_tbl_graph()
+
+# 시각화
+set.seed(970324)
+ggraph(graph_pair, layout = "fr") +
+  geom_edge_link() +  # 엣지
+  geom_node_point(size = 3, color = "skyblue") + # 노드 설정
+  geom_node_text(aes(label = name), repel = TRUE) + # 노드 텍스트
+  labs(title = "Pairwise Co-occurrence Network 핵또는미사일") +  # 그래프 제목
+  theme_void()  # 테마 설정
+
+
+
+# 특정단어랑 사용많이되는 단어찾아보기
+pairwise_counts %>% filter(item1 == "kim"|item2=="kim")
+
+# kim이 포함된 문장 중 함께 사용되는 단어 추출
+kim_co_occurrence <- pairwise_counts %>%
+  filter(item1 == "kim" | item2 == "kim")
+
+# kim과 함께 사용된 단어의 빈도를 카운트하여 데이터프레임으로 출력하고 내림차순으로 정렬
+kim_word_counts <- kim_co_occurrence %>%
+  group_by(word = ifelse(item1 == "kim", item2, item1)) %>%  # kim과 함께 사용된 단어를 word로 설정
+  summarise(count = sum(n)) %>%
+  arrange(desc(count))  # 내림차순으로 정렬
+
+# 상위 20개의 단어 추출
+top_20_words <- kim_word_counts %>%
+  top_n(20) %>%
+  arrange(desc(count))  # 내림차순으로 다시 정렬
+
+# 막대그래프 생성
+ggplot(top_20_words, aes(x = factor(word, levels = rev(top_20_words$word)), y = count)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(x = "단어", y = "출현 빈도", title = "kim과 함께 많이 출현한 상위 20개의 단어") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_flip()
+
+# 네트워크 그래프 생성
+kim_graph <- kim_co_occurrence %>%
+  filter(item1 %in% top_20_words$word | item2 %in% top_20_words$word) %>%
+  as_tbl_graph()
+
+# 노드의 크기를 단어의 등장 빈도에 비례하여 조정
+node_size <- kim_word_counts$count[match(V(kim_graph)$name, kim_word_counts$word)]
+node_size <- ifelse(is.na(node_size), 0, node_size)  # NA 값을 0으로 대체
+node_size <- node_size / max(node_size, na.rm = TRUE) * 30  # 최대 크기를 30으로 조정
+
+# 그래프 시각화
+set.seed(2849)
+ggraph(kim_graph, layout = "fr") +
+  geom_edge_link() +
+  geom_node_point(color = "yellow", size = node_size) +  # 노드의 크기 조정
+  geom_node_text(aes(label = name)) +
+  theme_void()
