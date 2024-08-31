@@ -1,0 +1,163 @@
+import os
+import sys
+import PyPDF2
+import re
+import torch
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+from collections import Counter
+
+# 사전 학습된 감성 분석 BERT 모델과 토크나이저 로드
+model_name = "distilbert-base-uncased-finetuned-sst-2-english"
+model = AutoModelForSequenceClassification.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# GPU 사용 가능 여부 확인 및 장치 설정
+if torch.cuda.is_available():
+    device = 0
+    model.to('cuda')  # 모델을 GPU로 이동
+else:
+    print("cuda is NOT available")
+    sys.exit()
+
+# 감정 분석 파이프라인 생성 (GPU 사용 설정)
+sentiment_analysis = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=device)
+
+# 폴더 경로 설정
+pdf_folder = r'C:/Users/dlsdn/Desktop/paper/nuclear'
+
+# PDF에서 텍스트 추출 함수
+def extract_text_from_pdfs(folder_path):
+    text = ""
+    for filename in os.listdir(folder_path):
+        if filename.lower().endswith('.pdf'):
+            file_path = os.path.join(folder_path, filename)
+            print(f"Processing file: {filename}")  # 처리 중인 파일 출력
+            with open(file_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                for page_number, page in enumerate(reader.pages):
+                    page_text = page.extract_text() or ""
+                    text += page_text
+    return text
+
+# 텍스트 전처리 함수
+def preprocess_text(text):
+    print("Preprocessing text...")
+    
+    # 모든 대문자를 소문자로 변환
+    text = text.lower()
+    
+    # 숫자 제거
+    text = re.sub(r'\d+', '', text)
+    
+    # 'leader'와 'leadership'을 'kim'으로 변경
+    text = text.replace('leader', 'kim').replace('leadership', 'kim')
+    
+    # 특수문자 제거 (쉼표와 마침표 제외)
+    text = re.sub(r'[^\w\s.,]', '', text)
+    
+    # 월 이름 제거
+    months = [
+        'january', 'february', 'march', 'april', 'may', 'june',
+        'july', 'august', 'september', 'october', 'november', 'december'
+    ]
+    text = re.sub(r'\b(?:' + '|'.join(months) + r')\b', '', text)
+    
+    # 토큰화
+    tokens = word_tokenize(text)
+    
+    # 불용어 제거
+    stop_words = set(stopwords.words('english'))
+    filtered_tokens = [word for word in tokens if word not in stop_words]
+    
+    print("Text preprocessing completed.")
+    return ' '.join(filtered_tokens)
+
+# 사용자 정의 문장 분리 함수
+def custom_sentence_split(text):
+    print("Starting sentence splitting...")
+    # 쉼표와 마침표를 기준으로 문장 나누기
+    sentences = re.split(r'(?<=\.)\s+|(?<=\,)\s+', text)
+
+    # 빈 문자열 제거
+    sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+    print("Sentence splitting completed.")
+
+    return sentences
+
+# 문장 단위로 분리하여 감정 분석 수행 함수
+def analyze_sentiment_text(text):
+    print("Starting sentiment analysis...")
+
+    print("# 1: split")
+    # 1. 텍스트를 문장 단위로 나누기
+    sentences = custom_sentence_split(text)
+
+    print("# 2: filtering")
+    # 2. 문장 길이 필터링: 문장의 단어 수가 5개 이상 512개 이하인 문장만 선택
+    filtered_sentences = []
+    for sentence in sentences:
+        tokens = word_tokenize(sentence)
+        if 5 <= len(tokens) <= 512:
+            filtered_sentences.append(sentence)
+
+    print("# 3: sentiment analysis")
+    # 3. 각 문장에 대해 감정 분석 수행
+    results = []
+    
+    for sentence in filtered_sentences:
+        # 문장이 너무 긴 경우 최대 길이에 맞게 잘라내기
+        if len(tokenizer.encode(sentence, truncation=True)) > 512:
+            continue  # 이 문장은 건너뛰고 다음 문장으로 넘어갑니다.
+
+        result = sentiment_analysis(sentence)
+        results.append(result[0])  # 결과는 리스트에 포함되므로 첫 번째 요소를 추가
+
+    print("# 4: result")
+    # 4. 결과 집계 (여기서는 간단히 레이블 빈도수 세기)
+    label_count = Counter()
+    score_sum = Counter()
+
+    for res in results:
+        label = res['label']
+        score = res['score']
+        label_count[label] += 1
+        score_sum[label] += score
+
+    # 각 레이블의 평균 스코어 계산
+    average_scores = {label: (score_sum[label] / label_count[label]) for label in label_count}
+
+    print("Sentiment analysis completed.")
+
+    return label_count, average_scores
+
+# 전체 파이프라인 함수
+def sentiment_analysis_pipeline(folder_path):
+    print("Starting sentiment analysis pipeline...")
+
+    # PDF에서 텍스트 추출
+    text = extract_text_from_pdfs(folder_path)
+
+    # 텍스트 전처리
+    cleaned_text = preprocess_text(text)
+
+    # 감정 분석 수행
+    label_count, average_scores = analyze_sentiment_text(cleaned_text)
+
+    print("Sentiment analysis pipeline completed.")
+
+    return label_count, average_scores
+
+# 전체 파이프라인 실행
+label_count, average_scores = sentiment_analysis_pipeline(pdf_folder)
+
+# 긍정, 부정 결과 집계 및 출력
+positive_count = label_count.get('POSITIVE', 0)
+negative_count = label_count.get('NEGATIVE', 0)
+positive_score = average_scores.get('POSITIVE', 0)
+negative_score = average_scores.get('NEGATIVE', 0)
+
+print(f"Positive: {positive_count}, Average Score: {positive_score:.2f}")
+print(f"Negative: {negative_count}, Average Score: {negative_score:.2f}")
